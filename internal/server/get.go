@@ -500,8 +500,19 @@ func (s *Server) getCDNURLWithRetry(source metadata.FileSource, itemID, fileID i
 		isRetryable := torbox.IsRetryable(res.err)
 
 		if !isRetryable || attempt >= maxRetries {
-			// Non-retryable or out of attempts — record and return.
-			s.recordTorrentFailure(itemID)
+			// Only count GENUINE per-item failures (non-retryable: 403/404 stale
+			// URL, invalid file_id, missing torrent) toward the circuit breaker.
+			// A retryable error that merely exhausted its attempts is an
+			// account-wide rate-limit (429 "rate limit exceeded") or a transient
+			// CDN/API blip — NOT this item's fault. Marking the healthy item stale
+			// would make it unreadable for CircuitBreakerStaleMin minutes and turn
+			// a rate-limit blip into mass unavailability (observed 2026-06-27: a
+			// bulk rescan 429-stormed requestdl and the breaker marked ~600 good
+			// items stale, blocking both imports and playback). The 429 is handled
+			// by the global cooldown/backoff instead.
+			if !isRetryable {
+				s.recordTorrentFailure(itemID)
+			}
 			slog.Warn("CDN URL fetch failed, non-retryable or exhausted",
 				"item_id", itemID,
 				"file_id", fileID,

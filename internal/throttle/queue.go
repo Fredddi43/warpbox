@@ -15,15 +15,16 @@ const queueBufferSize = 1024
 
 // Request represents a queued API call.
 type Request struct {
-	Label    string
-	Execute  func(ctx context.Context) error
+	Label   string
+	Execute func(ctx context.Context) error
 }
 
 // Queue is a rate-limited, blocking queue for TorBox API requests.
 type Queue struct {
 	mu         sync.Mutex
 	items      chan Request
-	rate       time.Duration
+	rate       time.Duration // base spacing between calls (from configured RPM)
+	backoff    float64       // adaptive multiplier (>=1.0); widens spacing on observed 429s, decays on success
 	lastCall   time.Time
 	totalCalls int64
 	callWindow []time.Time
@@ -47,10 +48,22 @@ type Stats struct {
 // requestsPerMinute sets the maximum sustained call rate.
 func NewQueue(requestsPerMinute int) *Queue {
 	return &Queue{
-		rate:  time.Minute / time.Duration(requestsPerMinute),
-		items: make(chan Request, queueBufferSize),
+		rate:    time.Minute / time.Duration(requestsPerMinute),
+		backoff: 1.0,
+		items:   make(chan Request, queueBufferSize),
 	}
 }
+
+// Adaptive backoff constants. On each observed 429 the spacing between ALL
+// queued API calls widens multiplicatively (so requestdl, mylist, and every
+// hang/poll re-fetch slow together until TorBox stops rate-limiting); each
+// successful call decays it back toward the configured base rate. This
+// self-tunes to TorBox's real per-endpoint ceiling without hard-coding it.
+const (
+	throttleBackoffGrow  = 1.5
+	throttleBackoffMax   = 8.0
+	throttleBackoffDecay = 0.95
+)
 
 // Stats returns current throttle statistics.
 func (q *Queue) Stats() Stats {
@@ -68,12 +81,12 @@ func (q *Queue) Stats() Stats {
 	}
 
 	return Stats{
-		TotalCalls:         q.totalCalls,
-		SuccessfulCalls:    q.successfulCalls,
-		FailedCalls:        q.failedCalls,
-		HTTP429Calls:       q.http429Calls,
-		CallsLastMinute:    recent,
-		RequestsPerMinute:  int(time.Minute / q.rate),
+		TotalCalls:        q.totalCalls,
+		SuccessfulCalls:   q.successfulCalls,
+		FailedCalls:       q.failedCalls,
+		HTTP429Calls:      q.http429Calls,
+		CallsLastMinute:   recent,
+		RequestsPerMinute: int(time.Minute / q.rate),
 	}
 }
 
@@ -92,13 +105,17 @@ func (q *Queue) processLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case r := <-q.items:
-			// Enforce minimum spacing between calls.
+			// Enforce minimum spacing between calls, widened by the adaptive
+			// backoff multiplier when TorBox has recently been rate-limiting.
+			q.mu.Lock()
+			eff := time.Duration(float64(q.rate) * q.backoff)
+			q.mu.Unlock()
 			elapsed := time.Since(q.lastCall)
-			if elapsed < q.rate {
+			if elapsed < eff {
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(q.rate - elapsed):
+				case <-time.After(eff - elapsed):
 				}
 			}
 
@@ -114,6 +131,13 @@ func (q *Queue) processLoop(ctx context.Context) {
 				slog.Debug("throttle request failed", "label", r.Label, "error", err)
 			} else {
 				q.successfulCalls++
+				// Recover toward the base rate as calls succeed.
+				if q.backoff > 1.0 {
+					q.backoff *= throttleBackoffDecay
+					if q.backoff < 1.0 {
+						q.backoff = 1.0
+					}
+				}
 			}
 			q.callWindow = append(q.callWindow, q.lastCall)
 			// Keep the window trimmed to roughly the last 60 seconds.
@@ -126,11 +150,21 @@ func (q *Queue) processLoop(ctx context.Context) {
 	}
 }
 
-// Record429 increments the 429 counter under lock.
+// Record429 increments the 429 counter and widens the adaptive spacing so that
+// ALL queued callers (requestdl, mylist, hang/poll re-fetches) slow together
+// until TorBox stops rate-limiting. Called from the TorBox client's 429 hook.
 func (q *Queue) Record429() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.http429Calls++
+	q.backoff *= throttleBackoffGrow
+	if q.backoff > throttleBackoffMax {
+		q.backoff = throttleBackoffMax
+	}
+	slog.Warn("throttle: 429 observed, widening API call spacing (adaptive backoff)",
+		"backoff_multiplier", q.backoff,
+		"effective_rpm", int(float64(time.Minute)/(float64(q.rate)*q.backoff)),
+	)
 }
 
 // Start launches the processing loop in a background goroutine.
