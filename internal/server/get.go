@@ -652,9 +652,26 @@ func (s *Server) handleGetCDNHang(w http.ResponseWriter, r *http.Request, file *
 	// Poll for CDN URL with exponential backoff on rate-limit errors.
 	pollInterval := cdnPollInterval
 	const maxPollInterval = 5 * time.Minute
+	// Bound total hang time. Polling requestdl indefinitely PERPETUATES a TorBox
+	// requestdl rate-limit penalty: each stuck read keeps re-calling requestdl,
+	// so the account never goes quiet long enough for the limit to lift
+	// (observed 2026-06-27 — infinite hang/poll across ~150 stuck reads held the
+	// account in an all-429 penalty where even a single requestdl call 429'd).
+	// Give up well before rclone's --timeout (60s) so the read fails cleanly
+	// (rclone tolerates the occasional error, maxErrorCount=10) and requestdl
+	// pressure drops enough for TorBox to lift the limit.
+	const maxHangDuration = 45 * time.Second
+	hangStart := time.Now()
 
 	var cdnURL string
 	for {
+		if time.Since(hangStart) > maxHangDuration {
+			slog.Warn("GET (hang): giving up after max hang duration to relieve requestdl pressure",
+				"path", file.Path,
+				"hang_seconds", time.Since(hangStart).Seconds(),
+			)
+			return
+		}
 		var fetchErr error
 		cdnURL, fetchErr = s.fetchCDNURL(file.Source, file.ItemID, file.FileID)
 		if fetchErr == nil {
