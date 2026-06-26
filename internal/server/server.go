@@ -11,11 +11,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	_ "net/http/pprof"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -71,6 +72,15 @@ type Server struct {
 	// CDN connection semaphore: limits concurrent proxy connections to TorBox CDN.
 	cdnSem chan struct{}
 
+	// Global CDN backoff gate. TorBox's CDN rate-limits downloads per ACCOUNT,
+	// not per file/URL — so when a byte-GET returns 429 (or a disguised text
+	// error body), re-fetching a fresh URL and retrying immediately just hits
+	// the same account-wide limit and amplifies the storm. Instead we pause ALL
+	// CDN byte-GETs until cdnCooldownUntil (honoring Retry-After when present),
+	// letting the limit reset, then retry the SAME (still-valid) URL.
+	cdnGateMu        sync.Mutex
+	cdnCooldownUntil time.Time
+
 	// Stop channel for periodic cleanup goroutines.
 	cleanupStopCh chan struct{}
 
@@ -93,8 +103,8 @@ type Server struct {
 	prevNumGC           uint32
 
 	// Library virtual path filters and lookup map.
-	virtualFilters   []*library.Filter
-	virtualPathMap   map[string]*library.Filter // name → filter for O(1) lookup
+	virtualFilters []*library.Filter
+	virtualPathMap map[string]*library.Filter // name → filter for O(1) lookup
 
 	// TorBox user info (refreshed periodically).
 	torboxUserInfo   *torbox.UserInfo
@@ -109,16 +119,16 @@ const webdavRoot = "/webdav"
 
 // Config holds the server-specific configuration.
 type Config struct {
-	ListenAddr         string
-	CDNTtlMinutes       int  // How long to cache CDN URLs (0 = disable)
-	CDNURLAutoRepair    bool // Auto-repair stale CDN URLs
-	CDNURLRepairRetries int  // Max repair retries per request
-	Version            string // Build version
-	RequestsPerMinute  int    // For landing page display
-	LogFormat          string // For landing page display
-	LogLevel           string // For landing page display
-	SyncIntervalMinute int    // For landing page display
-	SyncListPageSize   int    // For landing page display
+	ListenAddr          string
+	CDNTtlMinutes       int    // How long to cache CDN URLs (0 = disable)
+	CDNURLAutoRepair    bool   // Auto-repair stale CDN URLs
+	CDNURLRepairRetries int    // Max repair retries per request
+	Version             string // Build version
+	RequestsPerMinute   int    // For landing page display
+	LogFormat           string // For landing page display
+	LogLevel            string // For landing page display
+	SyncIntervalMinute  int    // For landing page display
+	SyncListPageSize    int    // For landing page display
 
 	// Pprof control.
 	EnablePprof bool // Enable /debug/pprof/ endpoints; default false
@@ -189,17 +199,17 @@ func New(cfg Config, store *metadata.Store, torBox *torbox.Client, queue *thrott
 		startTime: time.Now(),
 		csrfToken: csrfToken,
 
-		negativeCache:          make(map[string]*negativeCacheEntry),
-		torrentFailures:        make(map[int64]*torrentFailureTracker),
-		cleanupStopCh:          make(chan struct{}),
-		cdnSem:                 make(chan struct{}, maxConns),
+		negativeCache:            make(map[string]*negativeCacheEntry),
+		torrentFailures:          make(map[int64]*torrentFailureTracker),
+		cleanupStopCh:            make(chan struct{}),
+		cdnSem:                   make(chan struct{}, maxConns),
 		negativeCacheMaxEntries:  cfg.NegativeCacheMaxEntries,
 		circuitBreakerMaxEntries: cfg.CircuitBreakerMaxEntries,
-		configPath:             cfg.ConfigPath,
-		statsRetention:          time.Duration(cfg.StatsRetentionHours) * time.Hour,
-		statsChartSince:         time.Duration(cfg.StatsChartMinutes) * time.Minute,
-		virtualFilters:          virtualFilters,
-		virtualPathMap:          makeVirtualPathMap(virtualFilters),
+		configPath:               cfg.ConfigPath,
+		statsRetention:           time.Duration(cfg.StatsRetentionHours) * time.Hour,
+		statsChartSince:          time.Duration(cfg.StatsChartMinutes) * time.Minute,
+		virtualFilters:           virtualFilters,
+		virtualPathMap:           makeVirtualPathMap(virtualFilters),
 	}
 	// Fill the semaphore so we can Acquire/Release.
 	for i := 0; i < maxConns; i++ {
@@ -260,6 +270,76 @@ func (s *Server) AcquireCDNConn() {
 // ReleaseCDNConn returns a CDN connection slot.
 func (s *Server) ReleaseCDNConn() {
 	s.cdnSem <- struct{}{}
+}
+
+// CDN global-cooldown tuning. The cooldown is reactive (engaged on a 429) and
+// adaptive (honors Retry-After), so it tracks whatever TorBox's actual CDN
+// limit is rather than guessing a fixed rate. Bursts accumulate the cooldown
+// toward the cap, then hold there until the limit resets.
+const (
+	cdnCooldownBase = 5 * time.Second
+	cdnCooldownMax  = 60 * time.Second
+)
+
+// cdnWaitCooldown blocks until any active global CDN cooldown has elapsed.
+// Returns false if the request context is cancelled while waiting (client
+// disconnect / rclone timeout) so the caller can abort cleanly.
+func (s *Server) cdnWaitCooldown(ctx context.Context) bool {
+	for {
+		s.cdnGateMu.Lock()
+		var wait time.Duration
+		if now := time.Now(); s.cdnCooldownUntil.After(now) {
+			wait = s.cdnCooldownUntil.Sub(now)
+		}
+		s.cdnGateMu.Unlock()
+		if wait <= 0 {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(wait):
+		}
+	}
+}
+
+// cdnNote429 engages (or extends) the account-wide CDN cooldown after a CDN
+// rate-limit / transient error. It honors a Retry-After header when present,
+// otherwise adds cdnCooldownBase; repeated hits accumulate toward cdnCooldownMax.
+func (s *Server) cdnNote429(resp *http.Response) {
+	add := cdnCooldownBase
+	if resp != nil {
+		if secs := parseRetryAfterSeconds(resp.Header.Get("Retry-After")); secs > 0 {
+			add = time.Duration(secs) * time.Second
+		}
+	}
+	s.cdnGateMu.Lock()
+	now := time.Now()
+	var remaining time.Duration
+	if s.cdnCooldownUntil.After(now) {
+		remaining = s.cdnCooldownUntil.Sub(now)
+	}
+	total := remaining + add
+	if total > cdnCooldownMax {
+		total = cdnCooldownMax
+	}
+	s.cdnCooldownUntil = now.Add(total)
+	s.cdnGateMu.Unlock()
+	slog.Warn("CDN rate-limited — global cooldown engaged", "cooldown_seconds", total.Seconds())
+}
+
+// parseRetryAfterSeconds parses an integer-seconds Retry-After header value.
+// Returns 0 when absent or not an integer (HTTP-date form is uncommon for
+// TorBox's CDN and falls back to the default backoff).
+func parseRetryAfterSeconds(v string) int {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+		return n
+	}
+	return 0
 }
 
 // ConfigPath returns the path to the config file for runtime log level toggle.
@@ -786,4 +866,3 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	return nil
 }
-

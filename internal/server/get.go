@@ -165,6 +165,12 @@ func (s *Server) streamFileContent(w http.ResponseWriter, r *http.Request, file 
 		}
 		proxyReq.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", srvRange.Start, srvRange.End))
 
+		// Wait out any account-wide CDN cooldown before issuing the byte-GET so
+		// a 429 storm self-throttles instead of hammering TorBox's CDN limit.
+		if !s.cdnWaitCooldown(r.Context()) {
+			return
+		}
+
 		proxyResp, err := client.Do(proxyReq)
 		if err != nil {
 			slog.Error("GET: CDN proxy request failed", "error", err)
@@ -208,28 +214,30 @@ func (s *Server) streamFileContent(w http.ResponseWriter, r *http.Request, file 
 		}
 
 		// 429 (rate limit) and 5xx (server error) from the CDN are transient.
-		// Instead of returning 502 (which rclone counts as an error toward
-		// maxErrorCount=10), route into hang/poll mode. The cached CDN URL is
-		// invalidated so the poll loop will re-fetch a fresh URL and give the
-		// CDN time to drain connections.
+		// A 429 is an ACCOUNT-wide rate-limit, not a stale URL — so do NOT
+		// invalidate the cached URL (re-fetching a fresh one burns a throttled
+		// requestdl call and the new URL 429s too, amplifying the storm).
+		// Instead engage the global cooldown, then retry the SAME URL in-loop;
+		// only fall back to hang/poll once the in-request attempts are spent.
 		if proxyResp.StatusCode == http.StatusTooManyRequests ||
 			proxyResp.StatusCode >= 500 {
 			proxyResp.Body.Close()
-			slog.Warn("GET: CDN transient error, entering hang/poll mode",
+			s.cdnNote429(proxyResp)
+			slog.Warn("GET: CDN transient error, backing off (global cooldown)",
 				"path", file.Path,
 				"status", proxyResp.StatusCode,
 				"source", file.Source,
 				"item_id", file.ItemID,
 				"file_id", file.FileID,
+				"attempt", attempt+1,
 			)
-			// Invalidate the cached CDN URL so the hang loop fetches a fresh one.
-			if s.cfg.CDNTtlMinutes > 0 {
-				expiry := time.Now().Add(-1 * time.Hour)
-				if err := s.store.SetCDNURL(file.ID, "", expiry); err != nil {
-					slog.Error("GET: failed to invalidate CDN URL cache",
-						"path", file.Path, "error", err)
+			if attempt < maxAttempts-1 {
+				if !s.cdnWaitCooldown(r.Context()) {
+					return
 				}
+				continue // retry the same (still-valid) URL after the cooldown
 			}
+			// In-request attempts exhausted — hold the connection and poll.
 			s.handleGetCDNHang(w, r, file)
 			return
 		}
@@ -281,15 +289,17 @@ func (s *Server) streamFileContent(w http.ResponseWriter, r *http.Request, file 
 		// treat it like a transient 429 (invalidate the URL, hang/poll).
 		if ct := strings.ToLower(proxyResp.Header.Get("Content-Type")); strings.HasPrefix(ct, "text/") || strings.Contains(ct, "html") || strings.Contains(ct, "json") {
 			proxyResp.Body.Close()
-			slog.Warn("GET: CDN returned a text/error body on a 2xx data response (disguised rate-limit/error) — not streaming, entering hang/poll",
+			s.cdnNote429(proxyResp)
+			slog.Warn("GET: CDN returned a text/error body on a 2xx data response (disguised rate-limit/error) — not streaming, backing off",
 				"path", file.Path, "content_type", ct, "status", proxyResp.StatusCode,
-				"source", file.Source, "item_id", file.ItemID, "file_id", file.FileID,
+				"source", file.Source, "item_id", file.ItemID, "file_id", file.FileID, "attempt", attempt+1,
 			)
-			if s.cfg.CDNTtlMinutes > 0 {
-				expiry := time.Now().Add(-1 * time.Hour)
-				if err := s.store.SetCDNURL(file.ID, "", expiry); err != nil {
-					slog.Error("GET: failed to invalidate CDN URL cache", "path", file.Path, "error", err)
+			// Do NOT invalidate the URL (disguised 429 = account limit, not stale URL).
+			if attempt < maxAttempts-1 {
+				if !s.cdnWaitCooldown(r.Context()) {
+					return
 				}
+				continue
 			}
 			s.handleGetCDNHang(w, r, file)
 			return
@@ -658,6 +668,9 @@ func (s *Server) handleGetCDNHang(w http.ResponseWriter, r *http.Request, file *
 	s.AcquireCDNConn()
 	defer s.ReleaseCDNConn()
 
+	if !s.cdnWaitCooldown(r.Context()) {
+		return
+	}
 	proxyClient := &http.Client{Timeout: 30 * time.Second}
 	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, cdnURL, http.NoBody)
 	if err != nil {
@@ -669,6 +682,25 @@ func (s *Server) handleGetCDNHang(w http.ResponseWriter, r *http.Request, file *
 	proxyResp, err := proxyClient.Do(proxyReq)
 	if err != nil {
 		slog.Error("GET (hang): CDN proxy request failed", "path", file.Path, "error", err)
+		return
+	}
+
+	// If the CDN rate-limits or returns an error/text body here too, do NOT
+	// stream it (rclone's vfs-cache would persist the error text as file data,
+	// corrupting it). Engage the global cooldown and drop the connection
+	// cleanly — rclone tolerates an occasional dropped read (maxErrorCount=10).
+	if proxyResp.StatusCode == http.StatusTooManyRequests || proxyResp.StatusCode >= 500 {
+		proxyResp.Body.Close()
+		s.cdnNote429(proxyResp)
+		slog.Warn("GET (hang): CDN still rate-limited after recovery, dropping connection",
+			"path", file.Path, "status", proxyResp.StatusCode)
+		return
+	}
+	if ct := strings.ToLower(proxyResp.Header.Get("Content-Type")); strings.HasPrefix(ct, "text/") || strings.Contains(ct, "html") || strings.Contains(ct, "json") {
+		proxyResp.Body.Close()
+		s.cdnNote429(proxyResp)
+		slog.Warn("GET (hang): CDN returned text/error body, not streaming",
+			"path", file.Path, "content_type", ct)
 		return
 	}
 	defer proxyResp.Body.Close()
