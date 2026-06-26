@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mainlink0435/warpbox/internal/library"
@@ -171,13 +172,25 @@ func (s *Server) streamFileContent(w http.ResponseWriter, r *http.Request, file 
 			return
 		}
 
+		// Gate the CDN REQUEST itself behind the connection semaphore (sized by
+		// max_cdn_connections). The 429-prone operation is issuing concurrent CDN
+		// GETs, so the cap must bound client.Do — NOT just the io.Copy that
+		// streams the response. The old placement (around io.Copy only) let an
+		// unbounded burst of requests trip TorBox's per-account CDN limit before
+		// any byte was streamed. The slot is released exactly when proxyResp.Body
+		// is closed — which every branch below does (retry, hang, error, and the
+		// streaming path via its deferred Close) — so a stalled hang/poll, which
+		// closes the body before falling back, never holds a slot.
+		s.AcquireCDNConn()
 		proxyResp, err := client.Do(proxyReq)
 		if err != nil {
+			s.ReleaseCDNConn()
 			slog.Error("GET: CDN proxy request failed", "error", err)
 			// Network error — do not retry.
 			http.Error(w, "CDN proxy error", http.StatusBadGateway)
 			return
 		}
+		proxyResp.Body = &releaseOnceCloser{ReadCloser: proxyResp.Body, release: s.ReleaseCDNConn}
 
 		// Check for stale CDN URL.
 		if (proxyResp.StatusCode == http.StatusForbidden || proxyResp.StatusCode == http.StatusNotFound) &&
@@ -320,10 +333,9 @@ func (s *Server) streamFileContent(w http.ResponseWriter, r *http.Request, file 
 			w.WriteHeader(http.StatusOK)
 		}
 
-		// Acquire a CDN connection slot to prevent excessive concurrent
-		// connections from causing TorBox CDN 429s.
-		s.AcquireCDNConn()
-		defer s.ReleaseCDNConn()
+		// The CDN connection slot was acquired around client.Do above; it is
+		// released when proxyResp.Body is closed (deferred here, after the
+		// stream completes).
 		defer proxyResp.Body.Close()
 
 		// Stream from CDN → client.
@@ -345,6 +357,23 @@ func (s *Server) streamFileContent(w http.ResponseWriter, r *http.Request, file 
 
 	// All attempts exhausted without success.
 	http.Error(w, "CDN proxy error after retries", http.StatusBadGateway)
+}
+
+// releaseOnceCloser wraps a CDN response body so the connection slot acquired
+// around the request (s.AcquireCDNConn before client.Do) is released exactly
+// once — when the body is closed. Every GET branch closes the body (explicitly
+// on retry/hang/error paths, or via defer on the streaming path), so this frees
+// the semaphore on every path without a defer-in-loop slot leak, and without
+// holding a slot during the hang/poll fallback (which closes the body first).
+type releaseOnceCloser struct {
+	io.ReadCloser
+	once    sync.Once
+	release func()
+}
+
+func (c *releaseOnceCloser) Close() error {
+	c.once.Do(c.release)
+	return c.ReadCloser.Close()
 }
 
 // ---------------------------------------------------------------------------
